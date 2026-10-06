@@ -113,7 +113,8 @@ jobs:
           client-secret: ${{ secrets.PP_SP_CLIENT_SECRET }}
           tenant-id: ${{ secrets.PP_SP_TENANT_ID }}
 
-      - name: Verify service principal access
+      - name: Diagnose service principal app-read access
+        if: ${{ !inputs.confirm_deploy }}
         env:
           MS_CLI_USE_SP_AUTH: 'true'
           MS_CLI_SP_CLIENT_ID: ${{ secrets.PP_SP_CLIENT_ID }}
