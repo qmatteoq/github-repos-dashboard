@@ -126,6 +126,7 @@ jobs:
       - name: Deploy managed app
         id: deploy
         if: ${{ inputs.confirm_deploy }}
+        continue-on-error: true
         uses: microsoft/Managed-Apps/github-actions/ms-app-deploy@e5e03602ca77ea8a6fa55731ae356b3ea5128a26
         with:
           working-directory: '.'
@@ -138,12 +139,17 @@ jobs:
         env:
           CONFIRM_DEPLOY: ${{ inputs.confirm_deploy }}
           DEPLOYMENT_URL: ${{ steps.deploy.outputs.app-play-uri }}
+          DEPLOYMENT_OUTCOME: ${{ steps.deploy.outcome }}
         run: |
           {
             echo '## Managed app deployment'
             echo
             if [ "$CONFIRM_DEPLOY" = "true" ]; then
               echo '- Mode: deployment'
+              echo "- Deployment step result: $DEPLOYMENT_OUTCOME"
+              if [ "$DEPLOYMENT_OUTCOME" = "failure" ]; then
+                echo '- Deployment did not complete; review the action logs. The service principal may need Contributor access to the managed app.'
+              fi
             else
               echo '- Mode: validation-only'
               echo '- Live deploy skipped because confirm_deploy was false.'
@@ -153,3 +159,6 @@ jobs:
               echo "- Deployment URL: $DEPLOYMENT_URL"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CONFIRM_DEPLOY" = "true" ] && [ "$DEPLOYMENT_OUTCOME" = "failure" ]; then
+            echo "::warning::Managed app deployment failed. The validation and pack steps succeeded; review the deployment logs and service-principal permissions."
+          fi
