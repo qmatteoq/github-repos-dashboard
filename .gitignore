@@ -1,6 +1,12 @@
 node_modules
 dist
+.ms/
 .env
+.env.development
 .env.local
+.env.production
+.env.test
+.env.*
 .env.*.local
+*.credentials.json
 coverage

@@ -5,7 +5,6 @@ import { RepoCard } from './components/RepoCard';
 import { SummaryCards } from './components/SummaryCards';
 import {
   fetchAllOwnedRepos,
-  fetchRepoTechDetails,
   GitHubApiError,
   isAbortError,
   isValidGitHubUsername,
@@ -20,14 +19,8 @@ import {
   restoreRememberedUsername,
 } from './lib/dashboardState';
 import { readStoredUsername, writeStoredUsername } from './lib/persistence';
-import {
-  buildRepoDetailKey,
-  reconcileDetailStatesWithRepos,
-  reconcileExpandedRepos,
-  shouldFetchRepoDetails,
-} from './lib/repoDetailsState';
 import { buildPrimaryLanguageDistribution, collectPrimaryLanguages, filterAndSortRepos, summarizeRepos } from './lib/repoAnalysis';
-import type { GitHubRepo, RateLimitInfo, RepoDetailState, RepoFilters } from './types';
+import type { GitHubAccountType, RequestBackoffInfo, RepoFilters } from './types';
 
 const LAST_USERNAME_STORAGE_KEY = 'github-repos-dashboard:last-username';
 const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
@@ -40,12 +33,10 @@ const defaultFilters: RepoFilters = {
   fork: 'all',
 };
 
-const emptyRateLimit: RateLimitInfo = {
-  limit: null,
-  remaining: null,
-  resetAt: null,
+const emptyBackoff: RequestBackoffInfo = {
   retryAfterMs: null,
   cooldownUntil: null,
+  message: null,
 };
 
 export default function App() {
@@ -57,62 +48,44 @@ export default function App() {
     () => restoreRememberedUsername(restoredSession.value),
     [restoredSession.value],
   );
-  const [dashboard, setDashboard] = useState(() => createInitialDashboardState(restoredUsername));
+  const [accountType, setAccountType] = useState<GitHubAccountType>('user');
+  const [dashboard, setDashboard] = useState(() => createInitialDashboardState(restoredUsername, 'user'));
   const [inputUsername, setInputUsername] = useState(restoredUsername);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [persistenceWarning, setPersistenceWarning] = useState<string | null>(restoredSession.warning);
   const [filters, setFilters] = useState<RepoFilters>(defaultFilters);
-  const [rateLimit, setRateLimit] = useState<RateLimitInfo>(emptyRateLimit);
+  const [backoff, setBackoff] = useState<RequestBackoffInfo>(emptyBackoff);
   const [cooldownUntil, setCooldownUntil] = useState<number | null>(null);
   const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
   const [refreshIntervalMs, setRefreshIntervalMs] = useState(DEFAULT_REFRESH_INTERVAL_MS);
-  const [detailStates, setDetailStates] = useState<Record<string, RepoDetailState>>({});
-  const [expandedRepos, setExpandedRepos] = useState<Record<string, boolean>>({});
   const [isDocumentVisible, setIsDocumentVisible] = useState(document.visibilityState !== 'hidden');
   const [theme, setTheme] = useState<'light' | 'dark'>(
     document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light',
   );
   const requestControllerRef = useRef<AbortController | null>(null);
-  const detailRequestControllersRef = useRef<Record<string, AbortController>>({});
   const dashboardRef = useRef(dashboard);
-  const detailStatesRef = useRef(detailStates);
-  const expandedReposRef = useRef(expandedRepos);
 
   useEffect(() => {
     dashboardRef.current = dashboard;
   }, [dashboard]);
 
   useEffect(() => {
-    detailStatesRef.current = detailStates;
-  }, [detailStates]);
-
-  useEffect(() => {
-    expandedReposRef.current = expandedRepos;
-  }, [expandedRepos]);
-
-  const handleRateLimit = useCallback((info: RateLimitInfo) => {
-    setRateLimit(info);
-    if (info.cooldownUntil && info.cooldownUntil > Date.now()) {
-      setCooldownUntil(info.cooldownUntil);
-      return;
-    }
-
-    setCooldownUntil((current) => (current && current > Date.now() ? current : null));
-  }, []);
-
-  useEffect(() => {
     if (!cooldownUntil || cooldownUntil <= Date.now()) {
+      if (backoff.cooldownUntil !== null || backoff.message) {
+        setBackoff(emptyBackoff);
+      }
       return;
     }
 
     const timeout = window.setTimeout(() => {
       setCooldownUntil(null);
+      setBackoff(emptyBackoff);
     }, cooldownUntil - Date.now());
 
     return () => {
       window.clearTimeout(timeout);
     };
-  }, [cooldownUntil]);
+  }, [backoff.cooldownUntil, backoff.message, cooldownUntil]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -125,29 +98,37 @@ export default function App() {
     };
   }, []);
 
+  const handleBackoff = useCallback((info: RequestBackoffInfo) => {
+    setBackoff(info);
+    if (info.cooldownUntil && info.cooldownUntil > Date.now()) {
+      setCooldownUntil(info.cooldownUntil);
+      return;
+    }
+
+    setCooldownUntil((current) => (current && current > Date.now() ? current : null));
+  }, []);
+
   const loadRepositories = useCallback(
-    async (rawUsername: string, source: 'initial' | 'manual' | 'submit' | 'auto') => {
+    async (
+      rawUsername: string,
+      nextAccountType: GitHubAccountType,
+      source: 'initial' | 'manual' | 'submit' | 'auto',
+    ) => {
       const username = normalizeUsername(rawUsername);
-      const previousLoadedUsername = dashboardRef.current.loadedUsername;
-      const sameUser = previousLoadedUsername === username;
+      const sameRequest =
+        dashboardRef.current.loadedUsername === username &&
+        dashboardRef.current.loadedAccountType === nextAccountType;
 
       requestControllerRef.current?.abort();
       const controller = new AbortController();
       requestControllerRef.current = controller;
 
-      setDashboard((previous) => beginRepoLoad(previous, username));
-
-      if (!sameUser) {
-        Object.values(detailRequestControllersRef.current).forEach((detailController) => detailController.abort());
-        detailRequestControllersRef.current = {};
-        setDetailStates({});
-        setExpandedRepos({});
-      }
+      setDashboard((previous) => beginRepoLoad(previous, username, nextAccountType));
 
       try {
-        const repos = await fetchAllOwnedRepos(username, {
+        const repos = await fetchAllOwnedRepos(username, nextAccountType, {
           signal: controller.signal,
-          onRateLimit: handleRateLimit,
+          onBackoff: handleBackoff,
         });
 
         if (controller.signal.aborted) {
@@ -155,40 +136,48 @@ export default function App() {
         }
 
         const syncedAt = new Date().toISOString();
-        setDashboard((previous) => completeRepoLoadSuccess(previous, username, syncedAt, repos));
-        setDetailStates((previous) => reconcileDetailStatesWithRepos(previous, repos));
-        setExpandedRepos((previous) => reconcileExpandedRepos(previous, repos));
+        setDashboard((previous) =>
+          completeRepoLoadSuccess(previous, username, nextAccountType, syncedAt, repos),
+        );
+        setBackoff(emptyBackoff);
+        setCooldownUntil(null);
         setPersistenceWarning(writeStoredUsername(() => window.localStorage, LAST_USERNAME_STORAGE_KEY, username));
         if (source !== 'auto') {
           setInputUsername(username);
         }
+        if (!sameRequest) {
+          setFilters(defaultFilters);
+        }
       } catch (error) {
-        if (isAbortError(error)) {
+        if (
+          isAbortError(error) ||
+          controller.signal.aborted ||
+          requestControllerRef.current !== controller
+        ) {
           return;
         }
 
-        const message = formatUserFacingError(error, username);
+        const message = formatUserFacingError(error, username, nextAccountType);
         const attemptedAt = new Date().toISOString();
-        const nextCooldown = error instanceof GitHubApiError ? error.rateLimit?.cooldownUntil ?? null : null;
-        if (nextCooldown && nextCooldown > Date.now()) {
-          setCooldownUntil(nextCooldown);
+        if (error instanceof GitHubApiError && error.backoff.cooldownUntil && error.backoff.cooldownUntil > Date.now()) {
+          setCooldownUntil(error.backoff.cooldownUntil);
         }
 
-        setDashboard((previous) => completeRepoLoadFailure(previous, username, message, attemptedAt));
+        setDashboard((previous) =>
+          completeRepoLoadFailure(previous, username, nextAccountType, message, attemptedAt),
+        );
       }
     },
-    [handleRateLimit],
+    [handleBackoff],
   );
 
   useEffect(() => {
     if (restoredUsername) {
-      void loadRepositories(restoredUsername, 'initial');
+      void loadRepositories(restoredUsername, 'user', 'initial');
     }
 
     return () => {
       requestControllerRef.current?.abort();
-      Object.values(detailRequestControllersRef.current).forEach((detailController) => detailController.abort());
-      detailRequestControllersRef.current = {};
     };
   }, [loadRepositories, restoredUsername]);
 
@@ -224,8 +213,10 @@ export default function App() {
     }
 
     const timeout = window.setTimeout(() => {
-      if (dashboardRef.current.loadedUsername) {
-        void loadRepositories(dashboardRef.current.loadedUsername, 'auto');
+      const username = dashboardRef.current.loadedUsername;
+      const nextAccountType = dashboardRef.current.loadedAccountType;
+      if (username && nextAccountType) {
+        void loadRepositories(username, nextAccountType, 'auto');
       }
     }, autoRefreshDelay);
 
@@ -237,7 +228,7 @@ export default function App() {
   const handleSubmit = useCallback(() => {
     const candidate = normalizeUsername(inputUsername);
     if (!candidate) {
-      setValidationError('Enter a GitHub username or organization login.');
+      setValidationError('Enter a GitHub user or organization login.');
       return;
     }
 
@@ -247,21 +238,23 @@ export default function App() {
     }
 
     if (cooldownUntil && cooldownUntil > Date.now()) {
-      setValidationError(`GitHub is rate limited right now. Try again after ${new Date(cooldownUntil).toLocaleTimeString()}.`);
+      setValidationError(
+        `The connector asked this app to wait before retrying. Try again after ${new Date(cooldownUntil).toLocaleTimeString()}.`,
+      );
       return;
     }
 
     setValidationError(null);
-    void loadRepositories(candidate, 'submit');
-  }, [cooldownUntil, inputUsername, loadRepositories]);
+    void loadRepositories(candidate, accountType, 'submit');
+  }, [accountType, cooldownUntil, inputUsername, loadRepositories]);
 
   const handleRefresh = useCallback(() => {
-    if (!dashboard.loadedUsername || (cooldownUntil && cooldownUntil > Date.now())) {
+    if (!dashboard.loadedUsername || !dashboard.loadedAccountType || (cooldownUntil && cooldownUntil > Date.now())) {
       return;
     }
     setValidationError(null);
-    void loadRepositories(dashboard.loadedUsername, 'manual');
-  }, [cooldownUntil, dashboard.loadedUsername, loadRepositories]);
+    void loadRepositories(dashboard.loadedUsername, dashboard.loadedAccountType, 'manual');
+  }, [cooldownUntil, dashboard.loadedAccountType, dashboard.loadedUsername, loadRepositories]);
 
   const handleToggleTheme = useCallback(() => {
     const nextTheme = theme === 'dark' ? 'light' : 'dark';
@@ -269,129 +262,35 @@ export default function App() {
     setTheme(nextTheme);
   }, [theme]);
 
-  const loadRepoDetails = useCallback(
-    async (repo: GitHubRepo) => {
-      const key = buildRepoDetailKey(repo.owner.login, repo.name);
-      const currentState = detailStatesRef.current[key];
-      if (!shouldFetchRepoDetails(currentState, repo.pushed_at)) {
-        return;
-      }
-
-      setDetailStates((previous) => ({
-        ...previous,
-        [key]: {
-          status: 'loading',
-          repoPushedAt: repo.pushed_at,
-        },
-      }));
-      const controller = new AbortController();
-      detailRequestControllersRef.current[key] = controller;
-
-      try {
-        const details = await fetchRepoTechDetails(repo.owner.login, repo.name, repo.pushed_at, {
-          signal: controller.signal,
-          onRateLimit: handleRateLimit,
-        });
-
-        const currentRepo = dashboardRef.current.repos.find(
-          (candidate) => candidate.owner.login === repo.owner.login && candidate.name === repo.name,
-        );
-        if (
-          controller.signal.aborted ||
-          detailRequestControllersRef.current[key] !== controller ||
-          !currentRepo ||
-          currentRepo.pushed_at !== repo.pushed_at
-        ) {
-          return;
-        }
-
-        setDetailStates((previous) => ({
-          ...previous,
-          [key]: {
-            status: 'loaded',
-            repoPushedAt: repo.pushed_at,
-            data: details,
-          },
-        }));
-      } catch (error) {
-        if (isAbortError(error)) {
-          if (detailRequestControllersRef.current[key] === controller) {
-            setDetailStates((previous) => ({
-              ...previous,
-              [key]: {
-                status: 'idle',
-                repoPushedAt: repo.pushed_at,
-              },
-            }));
-          }
-          return;
-        }
-
-        const message = formatUserFacingError(error, `${repo.owner.login}/${repo.name}`);
-        if (detailRequestControllersRef.current[key] !== controller) {
-          return;
-        }
-        setDetailStates((previous) => ({
-          ...previous,
-          [key]: {
-            status: 'error',
-            repoPushedAt: repo.pushed_at,
-            error: message,
-          },
-        }));
-      } finally {
-        if (detailRequestControllersRef.current[key] === controller) {
-          delete detailRequestControllersRef.current[key];
-        }
-      }
-    },
-    [handleRateLimit],
-  );
-
-  const handleToggleDetails = useCallback(
-    async (repo: GitHubRepo) => {
-      const key = buildRepoDetailKey(repo.owner.login, repo.name);
-      const shouldExpand = !expandedReposRef.current[key];
-
-      setExpandedRepos((previous) => ({ ...previous, [key]: shouldExpand }));
-
-      if (shouldExpand) {
-        await loadRepoDetails(repo);
-      }
-    },
-    [loadRepoDetails],
-  );
-
-  useEffect(() => {
-    dashboard.repos.forEach((repo) => {
-      const key = buildRepoDetailKey(repo.owner.login, repo.name);
-      const detailState = detailStates[key];
-      const shouldRefreshExpandedDetail =
-        (expandedRepos[key] ?? false) &&
-        (!detailState || detailState.status === 'idle' || detailState.repoPushedAt !== repo.pushed_at);
-      if (shouldRefreshExpandedDetail) {
-        void loadRepoDetails(repo);
-      }
-    });
-  }, [dashboard.repos, detailStates, expandedRepos, loadRepoDetails]);
-
   const cooldownMessage =
     cooldownUntil && cooldownUntil > Date.now()
-      ? `GitHub API cooldown is active until ${new Date(cooldownUntil).toLocaleString()}.`
+      ? `Auto refresh is paused until ${new Date(cooldownUntil).toLocaleString()}.`
       : null;
 
   const lastSuccessfulSyncLabel = dashboard.lastSuccessfulSync
     ? new Date(dashboard.lastSuccessfulSync).toLocaleString()
     : null;
 
-  const canRefresh = Boolean(dashboard.loadedUsername) && dashboard.status !== 'loading' && !(cooldownUntil && cooldownUntil > Date.now());
+  const canRefresh =
+    Boolean(dashboard.loadedUsername) &&
+    dashboard.status !== 'loading' &&
+    !(cooldownUntil && cooldownUntil > Date.now());
+
+  const loadedLabel = dashboard.loadedAccountType === 'organization' ? 'organization' : 'user';
 
   return (
     <div className="app-shell">
       <ControlsBar
         inputUsername={inputUsername}
+        accountType={accountType}
         onInputUsernameChange={(value) => {
           setInputUsername(value);
+          if (validationError) {
+            setValidationError(null);
+          }
+        }}
+        onAccountTypeChange={(value) => {
+          setAccountType(value);
           if (validationError) {
             setValidationError(null);
           }
@@ -408,7 +307,7 @@ export default function App() {
         filters={filters}
         onFiltersChange={setFilters}
         languages={availableLanguages}
-        rateLimit={rateLimit}
+        backoff={backoff}
         cooldownMessage={cooldownMessage}
         activeTheme={theme}
         onToggleTheme={handleToggleTheme}
@@ -424,7 +323,9 @@ export default function App() {
             <div>
               <p className="eyebrow">Repository list</p>
               <h2 id="repos-panel-title">
-                {dashboard.loadedUsername ? `${dashboard.loadedUsername} repositories` : 'Load a GitHub account to begin'}
+                {dashboard.loadedUsername
+                  ? `${dashboard.loadedUsername} public ${loadedLabel} repositories`
+                  : 'Load a GitHub account to begin'}
               </h2>
             </div>
             <p className="panel-subtitle">
@@ -435,28 +336,32 @@ export default function App() {
           {dashboard.error ? (
             <div className={`status-banner${dashboard.stale ? ' status-banner-stale' : ''}`} role="alert">
               <p>{dashboard.error}</p>
-              {dashboard.stale ? <p>Showing the last successful data for {dashboard.loadedUsername}.</p> : null}
+              {dashboard.stale ? (
+                <p>
+                  Showing the last successful data for {dashboard.loadedUsername} as a {loadedLabel}.
+                </p>
+              ) : null}
             </div>
           ) : null}
 
           {dashboard.status === 'idle' && !dashboard.loadedUsername ? (
             <div className="empty-state">
-              <h3>Start with a public GitHub account</h3>
-              <p>Enter a username or organization login to load every public owner repository and unlock filtering, language insights, and on demand stack detection.</p>
+              <h3>Start in App Player with a hosted GitHub connection</h3>
+              <p>Use App Player or the Local Play URL from the global ms app dev command, sign in to the hosted GitHub connection, and then load a public user or organization owner.</p>
             </div>
           ) : null}
 
           {dashboard.status === 'loading' && dashboard.repos.length === 0 ? (
             <div className="empty-state">
               <h3>Loading repositories</h3>
-              <p>Fetching paginated public repository data from the GitHub REST API.</p>
+              <p>Fetching sequential pages of public repository data through the generated GitHub connector.</p>
             </div>
           ) : null}
 
           {dashboard.loadedUsername && dashboard.repos.length === 0 && dashboard.status === 'ready' ? (
             <div className="empty-state">
-              <h3>No public owner repositories found</h3>
-              <p>This account has no public repositories owned directly by the user or organization.</p>
+              <h3>No public repositories found</h3>
+              <p>This owner has no public repositories available through the selected connector listing operation.</p>
             </div>
           ) : null}
 
@@ -468,20 +373,9 @@ export default function App() {
           ) : null}
 
           <div className="repo-list">
-            {filteredRepos.map((repo) => {
-              const key = buildRepoDetailKey(repo.owner.login, repo.name);
-              return (
-                <RepoCard
-                  key={repo.id}
-                  repo={repo}
-                  detailState={detailStates[key] ?? { status: 'idle' }}
-                  expanded={expandedRepos[key] ?? false}
-                  onToggleDetails={() => {
-                    void handleToggleDetails(repo);
-                  }}
-                />
-              );
-            })}
+            {filteredRepos.map((repo) => (
+              <RepoCard key={repo.id} repo={repo} />
+            ))}
           </div>
         </section>
 
@@ -495,21 +389,33 @@ export default function App() {
   );
 }
 
-function formatUserFacingError(error: unknown, username: string): string {
+function formatUserFacingError(
+  error: unknown,
+  username: string,
+  accountType: GitHubAccountType,
+): string {
+  const ownerLabel = accountType === 'organization' ? 'organization' : 'user';
+
   if (error instanceof GitHubApiError) {
     if (error.code === 'rate_limit') {
-      const resetTime = error.rateLimit?.cooldownUntil
-        ? new Date(error.rateLimit.cooldownUntil).toLocaleString()
-        : error.rateLimit?.resetAt
-          ? new Date(error.rateLimit.resetAt).toLocaleString()
-          : null;
+      const resetTime = error.backoff.cooldownUntil
+        ? new Date(error.backoff.cooldownUntil).toLocaleString()
+        : null;
       return resetTime
-        ? `GitHub rate limits blocked new data for ${username}. Try again after ${resetTime}.`
-        : `GitHub rate limits blocked new data for ${username}.`;
+        ? `The hosted GitHub connector throttled requests for this ${ownerLabel}. Try again after ${resetTime}.`
+        : `The hosted GitHub connector throttled requests for this ${ownerLabel}.`;
+    }
+
+    if (error.code === 'connector_unavailable') {
+      return 'The GitHub connector is unavailable here. Open the app in App Player or the Local Play URL from the global ms app dev command, then sign in to the hosted GitHub connection.';
+    }
+
+    if (error.code === 'auth_required') {
+      return 'The hosted GitHub connection needs authentication. Open the app through App Player or the Local Play URL and complete the GitHub sign-in there.';
     }
 
     if (error.status === 404) {
-      return `GitHub could not find ${username}.`;
+      return `GitHub could not find the ${ownerLabel} ${username}.`;
     }
 
     return error.message;

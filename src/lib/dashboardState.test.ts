@@ -10,7 +10,7 @@ import {
 
 describe('dashboardState', () => {
   it('preserves same user data as stale on refresh failure', () => {
-    const initial = completeRepoLoadSuccess(createInitialDashboardState(), 'owner', '2026-01-01T00:00:00Z', [
+    const initial = completeRepoLoadSuccess(createInitialDashboardState(), 'owner', 'user', '2026-01-01T00:00:00Z', [
       {
         id: 1,
         name: 'repo',
@@ -30,8 +30,8 @@ describe('dashboardState', () => {
       },
     ]);
 
-    const loading = beginRepoLoad(initial, 'owner');
-    const failed = completeRepoLoadFailure(loading, 'owner', 'Network request failed.', '2026-01-01T00:05:00Z');
+    const loading = beginRepoLoad(initial, 'owner', 'user');
+    const failed = completeRepoLoadFailure(loading, 'owner', 'user', 'Network request failed.', '2026-01-01T00:05:00Z');
 
     expect(failed.stale).toBe(true);
     expect(failed.repos).toHaveLength(1);
@@ -41,9 +41,9 @@ describe('dashboardState', () => {
   });
 
   it('clears old data when a different username starts loading', () => {
-    const initial = completeRepoLoadSuccess(createInitialDashboardState(), 'owner', '2026-01-01T00:00:00Z', []);
-    const loading = beginRepoLoad(initial, 'other-owner');
-    const failed = completeRepoLoadFailure(loading, 'other-owner', 'Not found', '2026-01-01T00:02:00Z');
+    const initial = completeRepoLoadSuccess(createInitialDashboardState(), 'owner', 'user', '2026-01-01T00:00:00Z', []);
+    const loading = beginRepoLoad(initial, 'other-owner', 'user');
+    const failed = completeRepoLoadFailure(loading, 'other-owner', 'user', 'Not found', '2026-01-01T00:02:00Z');
 
     expect(loading.loadedUsername).toBeNull();
     expect(loading.repos).toHaveLength(0);
@@ -52,6 +52,24 @@ describe('dashboardState', () => {
     expect(failed.stale).toBe(false);
     expect(failed.loadedUsername).toBeNull();
     expect(failed.lastSuccessfulSync).toBeNull();
+  });
+
+  it('clears stale data when the same owner switches between user and organization modes', () => {
+    const initial = completeRepoLoadSuccess(createInitialDashboardState(), 'owner', 'user', '2026-01-01T00:00:00Z', []);
+    const loading = beginRepoLoad(initial, 'owner', 'organization');
+    const failed = completeRepoLoadFailure(
+      loading,
+      'owner',
+      'organization',
+      'Connector request failed.',
+      '2026-01-01T00:02:00Z',
+    );
+
+    expect(loading.loadedUsername).toBeNull();
+    expect(loading.loadedAccountType).toBeNull();
+    expect(failed.stale).toBe(false);
+    expect(failed.loadedUsername).toBeNull();
+    expect(failed.loadedAccountType).toBeNull();
   });
 
   it('pauses auto refresh while hidden or cooling down', () => {
@@ -100,11 +118,12 @@ describe('dashboardState', () => {
   });
 
   it('preserves empty successful data as stale when the next refresh fails', () => {
-    const initial = completeRepoLoadSuccess(createInitialDashboardState(), 'owner', '2026-01-01T00:00:00Z', []);
-    const loading = beginRepoLoad(initial, 'owner');
-    const failed = completeRepoLoadFailure(loading, 'owner', 'Network request failed.', '2026-01-01T00:03:00Z');
+    const initial = completeRepoLoadSuccess(createInitialDashboardState(), 'owner', 'user', '2026-01-01T00:00:00Z', []);
+    const loading = beginRepoLoad(initial, 'owner', 'user');
+    const failed = completeRepoLoadFailure(loading, 'owner', 'user', 'Network request failed.', '2026-01-01T00:03:00Z');
 
     expect(failed.loadedUsername).toBe('owner');
+    expect(failed.loadedAccountType).toBe('user');
     expect(failed.repos).toEqual([]);
     expect(failed.status).toBe('ready');
     expect(failed.stale).toBe(true);

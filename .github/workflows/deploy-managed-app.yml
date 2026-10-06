@@ -1,0 +1,154 @@
+name: Deploy managed app
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deploy:
+        description: 'Set to true to deploy from main; leave false to run validation-only checks, pack, and service-principal verification.'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-managed-app-d203bb2a-d163-448c-801c-3df90b89d198
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Pack and optionally deploy managed app
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NODE_OPTIONS: --network-family-autoselection-attempt-timeout=2000
+      MS_CLI_CLOUD_INSTANCE: prod
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Setup Node 24
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Validate workflow guardrails
+        env:
+          CURRENT_REF: ${{ github.ref }}
+          CURRENT_REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$CURRENT_REF" != "refs/heads/main" ]; then
+            echo "::error::This workflow only deploys from the main branch. Current ref: $CURRENT_REF_NAME"
+            exit 1
+          fi
+
+      - name: Validate required secrets
+        env:
+          PP_SP_CLIENT_ID: ${{ secrets.PP_SP_CLIENT_ID }}
+          PP_SP_CLIENT_SECRET: ${{ secrets.PP_SP_CLIENT_SECRET }}
+          PP_SP_TENANT_ID: ${{ secrets.PP_SP_TENANT_ID }}
+        run: |
+          missing=()
+          for name in PP_SP_CLIENT_ID PP_SP_CLIENT_SECRET PP_SP_TENANT_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required GitHub Actions secret(s): ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Validate managed app config
+        run: |
+          node <<'EOF'
+          const fs = require('node:fs');
+          const config = JSON.parse(fs.readFileSync('ms.config.json', 'utf8'));
+          const expectedAppId = 'd203bb2a-d163-448c-801c-3df90b89d198';
+          const expectedEnvironmentId = '52ad1371-bae3-ec57-85f7-e72f6d5b2304';
+          const githubConnectorId = '/providers/Microsoft.PowerApps/apis/shared_github';
+          const refs = Object.values(config.connectionReferences ?? {});
+          const hasGitHubConnector = refs.some((entry) => entry && entry.id === githubConnectorId);
+          if (config.appId !== expectedAppId) {
+            throw new Error(`Unexpected appId in ms.config.json: ${config.appId}`);
+          }
+          if (config.environmentId !== expectedEnvironmentId) {
+            throw new Error(`Unexpected environmentId in ms.config.json: ${config.environmentId}`);
+          }
+          if (config.repoType !== 'none') {
+            throw new Error(`Expected repoType "none" but found "${config.repoType}".`);
+          }
+          if (!hasGitHubConnector) {
+            throw new Error('GitHub connector reference is missing from ms.config.json.');
+          }
+          EOF
+
+      - name: Install app dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build app
+        run: npm run build
+
+      - name: Install managed apps CLI
+        uses: microsoft/Managed-Apps/github-actions/install-ms-cli@e5e03602ca77ea8a6fa55731ae356b3ea5128a26
+        with:
+          version: '0.27.0'
+
+      - name: Pack managed app
+        uses: microsoft/Managed-Apps/github-actions/ms-app-pack@e5e03602ca77ea8a6fa55731ae356b3ea5128a26
+        with:
+          working-directory: '.'
+          app-id: ${{ secrets.PP_SP_CLIENT_ID }}
+          client-secret: ${{ secrets.PP_SP_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_SP_TENANT_ID }}
+
+      - name: Verify service principal access
+        env:
+          MS_CLI_USE_SP_AUTH: 'true'
+          MS_CLI_SP_CLIENT_ID: ${{ secrets.PP_SP_CLIENT_ID }}
+          MS_CLI_SP_CLIENT_SECRET: ${{ secrets.PP_SP_CLIENT_SECRET }}
+          MS_CLI_SP_TENANT_ID: ${{ secrets.PP_SP_TENANT_ID }}
+          MS_CLI_CLOUD_INSTANCE: prod
+        run: ms app info --non-interactive --json
+
+      - name: Deploy managed app
+        id: deploy
+        if: ${{ inputs.confirm_deploy }}
+        uses: microsoft/Managed-Apps/github-actions/ms-app-deploy@e5e03602ca77ea8a6fa55731ae356b3ea5128a26
+        with:
+          working-directory: '.'
+          cloud: prod
+          app-id: ${{ secrets.PP_SP_CLIENT_ID }}
+          client-secret: ${{ secrets.PP_SP_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.PP_SP_TENANT_ID }}
+
+      - name: Publish deployment summary
+        env:
+          CONFIRM_DEPLOY: ${{ inputs.confirm_deploy }}
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.app-play-uri }}
+        run: |
+          {
+            echo '## Managed app deployment'
+            echo
+            if [ "$CONFIRM_DEPLOY" = "true" ]; then
+              echo '- Mode: deployment'
+            else
+              echo '- Mode: validation-only'
+              echo '- Live deploy skipped because confirm_deploy was false.'
+            fi
+            if [ -n "$DEPLOYMENT_URL" ]; then
+              echo
+              echo "- Deployment URL: $DEPLOYMENT_URL"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

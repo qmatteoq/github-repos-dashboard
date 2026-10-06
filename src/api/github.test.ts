@@ -1,12 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { IOperationResult } from '@microsoft/managed-apps/data';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   __resetGitHubApiTestState,
+  __setGitHubConnectorOperations,
   fetchAllOwnedRepos,
-  fetchRepoTechDetails,
   GitHubApiError,
 } from './github';
 
-function repo(id: number, name: string) {
+function repo(id: number, name: string, overrides: Record<string, unknown> = {}) {
   return {
     id,
     name,
@@ -23,368 +24,278 @@ function repo(id: number, name: string) {
     owner: {
       login: 'owner',
     },
+    ...overrides,
   };
 }
 
-function jsonResponse(body: unknown, init: ResponseInit = {}) {
-  return new Response(JSON.stringify(body), {
-    status: 200,
-    headers: {
-      'content-type': 'application/json',
-      ...init.headers,
-    },
-    ...init,
-  });
+type RuntimeFailureOperationResult<TResponse> = Omit<IOperationResult<TResponse>, 'data' | 'success'> & {
+  success: false;
+  data?: TResponse;
+};
+
+function asConnectorOperationResult<TResponse>(
+  result: IOperationResult<TResponse> | RuntimeFailureOperationResult<TResponse>,
+): IOperationResult<TResponse> {
+  return result as IOperationResult<TResponse>;
 }
 
-describe('github api helpers', () => {
-  it('waits for primary reset even when Retry-After is shorter', async () => {
-    __resetGitHubApiTestState();
-    const now = Date.parse('2026-01-01T00:00:00Z');
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(jsonResponse(
-      { message: 'API rate limit exceeded' },
-      { status: 403, headers: {
-        'x-ratelimit-remaining': '0',
-        'x-ratelimit-reset': String((now + 120_000) / 1000),
-        'retry-after': '10',
-      } },
-    ));
-    await expect(fetchAllOwnedRepos('owner', {
-      signal: new AbortController().signal,
-      now: () => now,
-    })).rejects.toMatchObject({ rateLimit: { cooldownUntil: now + 120_000 } });
-  });
-
+describe('github connector helpers', () => {
   beforeEach(() => {
     __resetGitHubApiTestState();
-    vi.restoreAllMocks();
   });
 
-  it('loads multiple pages, accepts numeric next links, and deduplicates overlapping ids', async () => {
-    const pageOne = Array.from({ length: 100 }, (_, index) => repo(index + 1, `repo-${index + 1}`));
-    const pageTwo = [repo(100, 'repo-100'), repo(101, 'repo-101'), repo(102, 'repo-102')];
-
-    const fetchMock = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(
-        jsonResponse(pageOne, {
-          headers: {
-            etag: 'page-one',
-            link: '<https://api.github.com/user/583231/repos?type=owner&per_page=100&page=2>; rel="next"',
-            'x-ratelimit-limit': '60',
-            'x-ratelimit-remaining': '58',
+  it('loads multiple user pages, unwraps data.value, and deduplicates ids', async () => {
+    const getUserReposPage = (owner: string, page: number) => {
+      expect(owner).toBe('owner');
+      if (page === 1) {
+        return Promise.resolve({
+          success: true,
+          data: {
+            value: Array.from({ length: 100 }, (_, index) => repo(index + 1, `repo-${index + 1}`)),
           },
-        }),
-      )
-      .mockResolvedValueOnce(
-        jsonResponse(pageTwo, {
-          headers: {
-            etag: 'page-two',
-            'x-ratelimit-limit': '60',
-            'x-ratelimit-remaining': '57',
-          },
-        }),
-      );
+        });
+      }
 
-    const repos = await fetchAllOwnedRepos('owner', {
+      return Promise.resolve({
+        success: true,
+        data: [repo(100, 'repo-100'), repo(101, 'repo-101')],
+      });
+    };
+
+    const getOrgReposPage = () => {
+      throw new Error('unexpected organization call');
+    };
+
+    __setGitHubConnectorOperations({ getUserReposPage, getOrgReposPage });
+
+    const repos = await fetchAllOwnedRepos('owner', 'user', {
       signal: new AbortController().signal,
     });
 
-    expect(repos).toHaveLength(102);
-    expect(repos.at(-1)?.id).toBe(102);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(String(fetchMock.mock.calls[1]?.[0])).toContain('/users/owner/repos');
+    expect(repos).toHaveLength(101);
+    expect(repos.at(-1)?.id).toBe(101);
   });
 
-  it('rejects exact repeated pages instead of looping forever', async () => {
-    const repeatedPage = Array.from({ length: 100 }, (_, index) => repo(index + 1, `repo-${index + 1}`));
+  it('uses the organization operation and filters private or internal repos defensively', async () => {
+    const getOrgReposPage = (owner: string, page: number) => {
+      expect(owner).toBe('owner');
+      expect(page).toBe(1);
+      return Promise.resolve({
+        success: true,
+        data: [
+          repo(1, 'public-repo', { visibility: 'public' }),
+          repo(2, 'private-repo', { private: true }),
+          repo(3, 'internal-repo', { visibility: 'internal' }),
+        ],
+      });
+    };
 
-    vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(
-        jsonResponse(repeatedPage, {
-          headers: {
-            link: '<https://api.github.com/user/583231/repos?type=owner&per_page=100&page=2>; rel="next"',
-          },
+    __setGitHubConnectorOperations({
+      getUserReposPage: () => {
+        throw new Error('unexpected user call');
+      },
+      getOrgReposPage,
+    });
+
+    const repos = await fetchAllOwnedRepos('owner', 'organization', {
+      signal: new AbortController().signal,
+    });
+
+    expect(repos.map((item) => item.name)).toEqual(['public-repo']);
+  });
+
+  it('supports empty result sets', async () => {
+    __setGitHubConnectorOperations({
+      getUserReposPage: () =>
+        Promise.resolve({
+          success: true,
+          data: [],
         }),
-      )
-      .mockResolvedValueOnce(jsonResponse(repeatedPage));
+    });
 
     await expect(
-      fetchAllOwnedRepos('owner', {
+      fetchAllOwnedRepos('owner', 'user', {
         signal: new AbortController().signal,
       }),
-    ).rejects.toMatchObject({
-      code: 'invalid_response',
-      message: 'GitHub pagination returned repeated repository data.',
-    } satisfies Partial<GitHubApiError>);
-  });
-
-  it('reuses cached data after a 304 response', async () => {
-    const page = [repo(1, 'repo-1')];
-    const fetchMock = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(
-        jsonResponse(page, {
-          headers: {
-            etag: 'repos-v1',
-          },
-        }),
-      )
-      .mockResolvedValueOnce(
-        new Response(null, {
-          status: 304,
-          headers: {
-            etag: 'repos-v1',
-          },
-        }),
-      );
-
-    const first = await fetchAllOwnedRepos('owner', {
-      signal: new AbortController().signal,
-    });
-    const second = await fetchAllOwnedRepos('owner', {
-      signal: new AbortController().signal,
-    });
-
-    expect(first).toEqual(second);
-    expect(fetchMock.mock.calls[1]?.[0]).toContain('/users/owner/repos');
-    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
-      headers: expect.any(Headers),
-    });
+    ).resolves.toEqual([]);
   });
 
   it('rejects malformed repository objects before rendering', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      jsonResponse([
-        {
-          ...repo(1, 'repo-1'),
-          owner: null,
-        },
-      ]),
-    );
-
-    await expect(
-      fetchAllOwnedRepos('owner', {
-        signal: new AbortController().signal,
-      }),
-    ).rejects.toMatchObject({
-      code: 'invalid_response',
-      message: 'GitHub returned malformed repository data at index 0.',
-    } satisfies Partial<GitHubApiError>);
-  });
-
-  it('preserves a cooldown announced by a successful response across later requests', async () => {
-    const now = Date.parse('2026-01-01T00:00:00Z');
-    const resetAtSeconds = Math.floor((now + 60_000) / 1000);
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      jsonResponse([repo(1, 'repo-1')], {
-        headers: {
-          'x-ratelimit-limit': '60',
-          'x-ratelimit-remaining': '0',
-          'x-ratelimit-reset': String(resetAtSeconds),
-        },
-      }),
-    );
-
-    await fetchAllOwnedRepos('owner', {
-      signal: new AbortController().signal,
-      now: () => now,
-    });
-
-    await expect(
-      fetchRepoTechDetails('owner', 'repo-1', '2026-01-01T00:00:00Z', {
-        signal: new AbortController().signal,
-        now: () => now + 1_000,
-      }),
-    ).rejects.toMatchObject({
-      code: 'rate_limit',
-      rateLimit: expect.objectContaining({
-        remaining: 0,
-        cooldownUntil: (now + 60_000),
-      }),
-    } satisfies Partial<GitHubApiError>);
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('surfaces rate limit cooldown data for exhausted primary quota responses', async () => {
-    const now = Date.parse('2026-01-01T00:00:00Z');
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(JSON.stringify({ message: 'API rate limit exceeded' }), {
-        status: 403,
-        headers: {
-          'content-type': 'application/json',
-          'x-ratelimit-remaining': '0',
-          'x-ratelimit-limit': '60',
-          'x-ratelimit-reset': String(Math.floor((now + 60_000) / 1000)),
-        },
-      }),
-    );
-
-    await expect(
-      fetchAllOwnedRepos('owner', {
-        signal: new AbortController().signal,
-        now: () => now,
-      }),
-    ).rejects.toMatchObject({
-      code: 'rate_limit',
-      rateLimit: expect.objectContaining({
-        remaining: 0,
-      }),
-    } satisfies Partial<GitHubApiError>);
-  });
-
-  it('uses a fallback cooldown for secondary limit responses without headers', async () => {
-    const now = Date.parse('2026-01-01T00:00:00Z');
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(JSON.stringify({ message: 'You have exceeded a secondary rate limit.' }), {
-        status: 403,
-        headers: {
-          'content-type': 'application/json',
-          'x-ratelimit-remaining': '10',
-        },
-      }),
-    );
-
-    await expect(
-      fetchAllOwnedRepos('owner', {
-        signal: new AbortController().signal,
-        now: () => now,
-      }),
-    ).rejects.toMatchObject({
-      code: 'rate_limit',
-      rateLimit: expect.objectContaining({
-        retryAfterMs: 60_000,
-        cooldownUntil: now + 60_000,
-      }),
-    } satisfies Partial<GitHubApiError>);
-  });
-
-  it('parses HTTP-date Retry-After values', async () => {
-    const now = Date.parse('2026-01-01T00:00:00Z');
-    const retryAfter = new Date(now + 45_000).toUTCString();
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(JSON.stringify({ message: 'API rate limit exceeded' }), {
-        status: 403,
-        headers: {
-          'content-type': 'application/json',
-          'retry-after': retryAfter,
-        },
-      }),
-    );
-
-    await expect(
-      fetchAllOwnedRepos('owner', {
-        signal: new AbortController().signal,
-        now: () => now,
-      }),
-    ).rejects.toMatchObject({
-      code: 'rate_limit',
-      rateLimit: expect.objectContaining({
-        retryAfterMs: 45_000,
-        cooldownUntil: now + 45_000,
-      }),
-    } satisfies Partial<GitHubApiError>);
-  });
-
-  it('does not treat unrelated permission 403 errors as rate limits', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(JSON.stringify({ message: 'Resource not accessible by integration' }), {
-        status: 403,
-        headers: {
-          'content-type': 'application/json',
-          'x-ratelimit-remaining': '42',
-        },
-      }),
-    );
-
-    await expect(
-      fetchAllOwnedRepos('owner', {
-        signal: new AbortController().signal,
-      }),
-    ).rejects.toMatchObject({
-      code: 'http',
-      status: 403,
-    } satisfies Partial<GitHubApiError>);
-  });
-
-  it('allows retrying repo details after an aborted caller and invalidates caches by pushed_at', async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(jsonResponse({ TypeScript: 100 }))
-      .mockResolvedValueOnce(jsonResponse([{ name: 'package.json', type: 'file', size: 120 }]))
-      .mockResolvedValueOnce(
-        jsonResponse({
-          type: 'file',
-          name: 'package.json',
-          size: 120,
-          encoding: 'base64',
-          content: btoa(JSON.stringify({ dependencies: { react: '^19.0.0' } })),
+    __setGitHubConnectorOperations({
+      getUserReposPage: () =>
+        Promise.resolve({
+          success: true,
+          data: [
+            {
+              ...repo(1, 'repo-1'),
+              owner: null,
+            },
+          ],
         }),
-      )
-      .mockResolvedValueOnce(jsonResponse({ TypeScript: 100 }))
-      .mockResolvedValueOnce(jsonResponse([{ name: 'package.json', type: 'file', size: 120 }]))
-      .mockResolvedValueOnce(
-        jsonResponse({
-          type: 'file',
-          name: 'package.json',
-          size: 120,
-          encoding: 'base64',
-          content: btoa(JSON.stringify({ dependencies: { react: '^19.0.0', '@nestjs/core': '^11.0.0' } })),
-        }),
-      );
+    });
 
-    const abortedController = new AbortController();
-    abortedController.abort();
     await expect(
-      fetchRepoTechDetails('owner', 'repo-1', '2026-01-01T00:00:00Z', {
-        signal: abortedController.signal,
+      fetchAllOwnedRepos('owner', 'user', {
+        signal: new AbortController().signal,
       }),
-    ).rejects.toThrow(/aborted/i);
-
-    const first = await fetchRepoTechDetails('owner', 'repo-1', '2026-01-01T00:00:00Z', {
-      signal: new AbortController().signal,
-    });
-    const second = await fetchRepoTechDetails('owner', 'repo-1', '2026-01-01T00:00:00Z', {
-      signal: new AbortController().signal,
-    });
-    const refreshed = await fetchRepoTechDetails('owner', 'repo-1', '2026-01-02T00:00:00Z', {
-      signal: new AbortController().signal,
-    });
-
-    expect(first.frameworks).toEqual(['React']);
-    expect(second).toEqual(first);
-    expect(refreshed.frameworks).toEqual(['NestJS', 'React']);
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+    ).rejects.toMatchObject({
+      code: 'invalid_response',
+      message: 'The GitHub connector returned malformed repository data at index 0.',
+    } satisfies Partial<GitHubApiError>);
   });
 
-  it('rejects malformed language maps and root content payloads visibly', async () => {
-    vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(jsonResponse({ TypeScript: 'lots' }))
-      .mockResolvedValueOnce(jsonResponse([{ name: 'package.json', type: 'file', size: 120 }]));
+  it('rejects full repeated pages instead of looping forever', async () => {
+    const repeatedPage = Array.from({ length: 100 }, (_, index) => repo(index + 1, `repo-${index + 1}`));
+
+    __setGitHubConnectorOperations({
+      getUserReposPage: () =>
+        Promise.resolve({
+          success: true,
+          data: repeatedPage,
+        }),
+    });
 
     await expect(
-      fetchRepoTechDetails('owner', 'repo-1', '2026-01-01T00:00:00Z', {
+      fetchAllOwnedRepos('owner', 'user', {
         signal: new AbortController().signal,
       }),
     ).rejects.toMatchObject({
       code: 'invalid_response',
-      message: 'GitHub returned malformed language breakdown data.',
+      message: 'GitHub connector pagination returned repeated repository data.',
     } satisfies Partial<GitHubApiError>);
+  });
 
-    __resetGitHubApiTestState();
-    vi.restoreAllMocks();
-    vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(jsonResponse({ TypeScript: 100 }))
-      .mockResolvedValueOnce(jsonResponse({ unexpected: true }));
+  it('surfaces connector authentication errors clearly', async () => {
+    __setGitHubConnectorOperations({
+      getUserReposPage: () =>
+        Promise.resolve(
+          asConnectorOperationResult({
+            success: false,
+            error: {
+              message: 'User is not signed in to this connection.',
+              status: 401,
+            },
+          }),
+        ),
+    });
 
     await expect(
-      fetchRepoTechDetails('owner', 'repo-1', '2026-01-01T00:00:00Z', {
+      fetchAllOwnedRepos('owner', 'user', {
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toMatchObject({
+      code: 'auth_required',
+      status: 401,
+    } satisfies Partial<GitHubApiError>);
+  });
+
+  it('surfaces connector failures even when the sdk omits data on success=false', async () => {
+    __setGitHubConnectorOperations({
+      getUserReposPage: () =>
+        Promise.resolve(
+          asConnectorOperationResult({
+            success: false,
+            error: {
+              message: 'Too many requests. Retry after 30 seconds.',
+              status: 429,
+            },
+          }),
+        ),
+    });
+
+    await expect(
+      fetchAllOwnedRepos('owner', 'user', {
+        signal: new AbortController().signal,
+      }),
+    ).rejects.toMatchObject({
+      code: 'rate_limit',
+      status: 429,
+    } satisfies Partial<GitHubApiError>);
+  });
+
+  it('captures connector retry guidance from throttling errors', async () => {
+    let receivedBackoffMessage: string | null = null;
+
+    __setGitHubConnectorOperations({
+      getUserReposPage: () =>
+        Promise.resolve({
+          success: false,
+          data: [],
+          error: {
+            message: 'Too many requests. Retry after 30 seconds.',
+            status: 429,
+          },
+        }),
+    });
+
+    await expect(
+      fetchAllOwnedRepos('owner', 'user', {
+        signal: new AbortController().signal,
+        now: () => Date.parse('2026-01-01T00:00:00Z'),
+        onBackoff: (info) => {
+          receivedBackoffMessage = info.message;
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: 'rate_limit',
+      backoff: {
+        retryAfterMs: 30_000,
+        cooldownUntil: Date.parse('2026-01-01T00:00:30Z'),
+        message: 'Connector retry guidance received: wait 30 seconds before retrying.',
+      },
+    } satisfies Partial<GitHubApiError>);
+
+    expect(receivedBackoffMessage).toContain('wait 30 seconds');
+  });
+
+  it('rejects impossible success results that also include an error payload', async () => {
+    __setGitHubConnectorOperations({
+      getUserReposPage: () =>
+        Promise.resolve({
+          success: true,
+          data: [],
+          error: new Error('unexpected'),
+        }),
+    });
+
+    await expect(
+      fetchAllOwnedRepos('owner', 'user', {
         signal: new AbortController().signal,
       }),
     ).rejects.toMatchObject({
       code: 'invalid_response',
-      message: 'GitHub returned malformed repository root contents.',
+      message: 'The GitHub connector reported both success and error for the same request.',
     } satisfies Partial<GitHubApiError>);
+  });
+
+  it('treats late connector rejections after abort as aborts without notifying backoff', async () => {
+    let onBackoffCalled = false;
+
+    __setGitHubConnectorOperations({
+      getUserReposPage: () =>
+        new Promise<IOperationResult<never>>((_resolve, reject) => {
+          setTimeout(() => {
+            reject({
+              message: 'Too many requests. Retry after 30 seconds.',
+              status: 429,
+            });
+          }, 0);
+        }),
+    });
+
+    const controller = new AbortController();
+    const pendingRepos = fetchAllOwnedRepos('owner', 'user', {
+      signal: controller.signal,
+      onBackoff: () => {
+        onBackoffCalled = true;
+      },
+    });
+
+    controller.abort();
+
+    await expect(pendingRepos).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    expect(onBackoffCalled).toBe(false);
   });
 });

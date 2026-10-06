@@ -1,10 +1,15 @@
 import { normalizeUsername, isValidGitHubUsername } from '../api/github';
-import type { RepoDashboardState } from '../types';
+import type { GitHubAccountType, RepoDashboardState } from '../types';
 
-export function createInitialDashboardState(restoredUsername = ''): RepoDashboardState {
+export function createInitialDashboardState(
+  restoredUsername = '',
+  restoredAccountType: GitHubAccountType = 'user',
+): RepoDashboardState {
   return {
     requestedUsername: restoredUsername,
+    requestedAccountType: restoredAccountType,
     loadedUsername: null,
+    loadedAccountType: null,
     repos: [],
     status: 'idle',
     stale: false,
@@ -14,33 +19,43 @@ export function createInitialDashboardState(restoredUsername = ''): RepoDashboar
   };
 }
 
-export function beginRepoLoad(state: RepoDashboardState, username: string): RepoDashboardState {
+export function beginRepoLoad(
+  state: RepoDashboardState,
+  username: string,
+  accountType: GitHubAccountType,
+): RepoDashboardState {
   const normalizedUsername = normalizeUsername(username);
-  const sameUser = state.loadedUsername === normalizedUsername;
+  const sameRequest =
+    state.loadedUsername === normalizedUsername && state.loadedAccountType === accountType;
 
   return {
     ...state,
     requestedUsername: normalizedUsername,
-    loadedUsername: sameUser ? state.loadedUsername : null,
-    repos: sameUser ? state.repos : [],
+    requestedAccountType: accountType,
+    loadedUsername: sameRequest ? state.loadedUsername : null,
+    loadedAccountType: sameRequest ? state.loadedAccountType : null,
+    repos: sameRequest ? state.repos : [],
     stale: false,
     error: null,
     status: 'loading',
-    lastSuccessfulSync: sameUser ? state.lastSuccessfulSync : null,
-    lastAttemptCompletedAt: sameUser ? state.lastAttemptCompletedAt : null,
+    lastSuccessfulSync: sameRequest ? state.lastSuccessfulSync : null,
+    lastAttemptCompletedAt: sameRequest ? state.lastAttemptCompletedAt : null,
   };
 }
 
 export function completeRepoLoadSuccess(
   state: RepoDashboardState,
   username: string,
+  accountType: GitHubAccountType,
   syncedAt: string,
   repos: RepoDashboardState['repos'],
 ): RepoDashboardState {
   return {
     ...state,
     requestedUsername: username,
+    requestedAccountType: accountType,
     loadedUsername: username,
+    loadedAccountType: accountType,
     repos,
     status: 'ready',
     stale: false,
@@ -53,19 +68,25 @@ export function completeRepoLoadSuccess(
 export function completeRepoLoadFailure(
   state: RepoDashboardState,
   username: string,
+  accountType: GitHubAccountType,
   message: string,
   attemptedAt: string,
 ): RepoDashboardState {
   const normalizedUsername = normalizeUsername(username);
-  const preserveExisting = state.loadedUsername === normalizedUsername && state.lastSuccessfulSync !== null;
+  const preserveExisting =
+    state.loadedUsername === normalizedUsername &&
+    state.loadedAccountType === accountType &&
+    state.lastSuccessfulSync !== null;
 
   return {
     ...state,
     requestedUsername: normalizedUsername,
+    requestedAccountType: accountType,
     status: preserveExisting ? 'ready' : 'error',
     stale: preserveExisting,
     error: message,
     loadedUsername: preserveExisting ? state.loadedUsername : null,
+    loadedAccountType: preserveExisting ? state.loadedAccountType : null,
     repos: preserveExisting ? state.repos : [],
     lastSuccessfulSync: preserveExisting ? state.lastSuccessfulSync : null,
     lastAttemptCompletedAt: attemptedAt,

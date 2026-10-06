@@ -1,3 +1,5 @@
+export type GitHubAccountType = 'user' | 'organization';
+
 export interface GitHubRepo {
   id: number;
   name: string;
@@ -11,18 +13,18 @@ export interface GitHubRepo {
   forks_count: number;
   archived: boolean;
   fork: boolean;
+  private?: boolean;
+  visibility?: string;
   topics?: string[];
   owner: {
     login: string;
   };
 }
 
-export interface RateLimitInfo {
-  limit: number | null;
-  remaining: number | null;
-  resetAt: string | null;
+export interface RequestBackoffInfo {
   retryAfterMs: number | null;
   cooldownUntil: number | null;
+  message: string | null;
 }
 
 export interface RepoFilters {
@@ -45,43 +47,11 @@ export interface LanguageDistributionItem {
   count: number;
 }
 
-export interface RootContentEntry {
-  name: string;
-  type: 'file' | 'dir' | 'symlink' | 'submodule';
-  size?: number;
-}
-
-export interface ManifestFile {
-  name: string;
-  text: string;
-}
-
-export interface LanguageBreakdownItem {
-  language: string;
-  bytes: number;
-  percentage: number;
-}
-
-export interface RepoTechDetails {
-  languageBreakdown: LanguageBreakdownItem[];
-  frameworks: string[];
-  tooling: string[];
-  rootSignals: string[];
-  evidenceFiles: string[];
-  notes: string[];
-  manifestStatus: 'available' | 'empty' | 'unavailable';
-}
-
-export interface RepoDetailState {
-  status: 'idle' | 'loading' | 'loaded' | 'error';
-  repoPushedAt?: string | null;
-  data?: RepoTechDetails;
-  error?: string;
-}
-
 export interface RepoDashboardState {
   requestedUsername: string;
+  requestedAccountType: GitHubAccountType;
   loadedUsername: string | null;
+  loadedAccountType: GitHubAccountType | null;
   repos: GitHubRepo[];
   status: 'idle' | 'loading' | 'ready' | 'error';
   stale: boolean;

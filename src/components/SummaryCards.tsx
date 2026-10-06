@@ -24,7 +24,7 @@ export function SummaryCards({ summary, filteredCount }: SummaryCardsProps) {
     {
       label: 'Total stars',
       value: summary.totalStars.toLocaleString(),
-      detail: 'Across all loaded repositories',
+      detail: 'Across all loaded public repositories',
       path: 'm12 3 2.9 5.9 6.6 1-4.8 4.7 1.1 6.7L12 18l-5.8 3.3 1.1-6.7L2.5 9.9l6.6-1L12 3Z',
     },
     {

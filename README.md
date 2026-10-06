@@ -1,19 +1,35 @@
 # GitHub repository insights dashboard
 
-This app loads all public repositories owned by a GitHub user or organization, then lets you filter, sort, and inspect the public metadata in a standalone browser client.
+This managed runtime app loads public repositories for a GitHub user or organization through the generated GitHub Power Platform connector and visualizes primary language counts, stars, forks, descriptions, update dates, archive state, and fork state in a React, TypeScript, and Vite client.
 
-## Setup
+## Runtime requirements
 
-Use Node.js 22 or later, then install dependencies with the existing npm configuration already available on your machine:
+Run the app through Microsoft App Player or the Local Play URL printed by the globally installed `ms app dev` command. A plain standalone Vite URL cannot call the hosted GitHub connector because the managed apps SDK depends on the host bridge and connection context.
+
+Sign in to the hosted GitHub connection in App Player before loading data. The dashboard only uses the generated public listing operations: `GetRepos` for users with `type=owner` and `GetOrgRepos` for organizations with `type=public`.
+
+The dashboard now reports primary language counts only. It does not fetch language byte shares, manifests, framework hints, tooling hints, or any direct `api.github.com` metadata.
+
+## Local development
+
+Use Node.js 24.11 or later and keep your existing company-managed npm configuration. Local installs in this repository must continue to use the machine's configured internal proxy registry; do not add a project `.npmrc` registry override.
+
+Install dependencies:
 
 ```bash
 npm install
 ```
 
-Start the local development server when needed:
+Start local development through the global managed apps CLI so the connector bridge is available:
 
 ```bash
-npm run dev
+ms app dev
+```
+
+Run tests:
+
+```bash
+npm test
 ```
 
 Build the production bundle:
@@ -22,33 +38,28 @@ Build the production bundle:
 npm run build
 ```
 
-Run the test suite:
+## Managed runtime registration
 
-```bash
-npm test
-```
+`ms.config.json` is already stamped for the real managed runtime app with app ID `d203bb2a-d163-448c-801c-3df90b89d198`, environment ID `52ad1371-bae3-ec57-85f7-e72f6d5b2304`, `repoType` `none`, cloud `public`, build path `./dist`, and build command `npm run build`.
 
-## What the app does
+The managed runtime app ID above is not the same as the deployment service principal client ID. Keep using the existing managed runtime IDs in source control; deployment automation uses the separate service principal `github-repos-dashboard-deploy` with client ID `c9ff501a-e47f-48df-b885-50a13e37bd40`, an environment-scoped `EnvironmentAdmin` role assignment, and GitHub Actions secrets `PP_SP_CLIENT_ID`, `PP_SP_CLIENT_SECRET`, and `PP_SP_TENANT_ID`.
 
-- Loads all public owner repositories through the GitHub REST API endpoint `GET /users/{username}/repos?type=owner&per_page=100`, following pagination until the full owned set is complete.
-- Shows repository metadata including owner, description, updated date, optional pushed date, primary language, stars, forks, and archive or fork badges.
-- Provides summary cards for total repositories, stars, forks, and distinct primary languages.
-- Filters by search text, primary language, archived state, and fork state, then sorts by updated date, stars, or name.
-- Refreshes manually or every 5, 15, or 30 minutes. Auto refresh defaults to 5 minutes, pauses when the tab is hidden and during rate limit cooldown windows, and waits a full interval after a failed attempt before retrying.
-- Fetches on demand repository detail data for language byte percentages plus framework and tooling hints detected from root manifests and root file names.
+Because this app uses `repoType: none`, the repository does not need direct Enterprise Cloud source binding and does not represent an internal managed-runtime Git-backed app. Deployment uploads an external artifact instead.
 
-## Public API limitations
+## Manual GitHub Actions deployment
 
-This app uses only public unauthenticated GitHub API requests from the browser. Typical unauthenticated limits are 60 requests per hour per IP, though GitHub can change that behavior. The UI shows remaining requests and the reset time when GitHub provides those headers.
+The repository includes `.github/workflows/deploy-managed-app.yml` for manual deployment only. It does not deploy on push yet.
 
-Repository tech detection is evidence based and root only. It inspects the root contents listing and reads at most two small root manifests through the GitHub contents API. Nested manifests, generated files, monorepo workspaces, and private dependencies are outside scope, so missing detections do not prove a tool is absent.
+The target environment has external artifact deployment enabled, and the repository secrets above are now configured. Rotate `PP_SP_CLIENT_SECRET` before its current expiration at `2027-01-04T14:50:26Z`; do not store or document the secret value in this repository.
 
-Tech details are cached in memory until the repository's push timestamp changes. Expanded details reload after a repository refresh detects a new push. A failed refresh preserves the last successful repository list and marks it stale; an incomplete paginated response is never shown as the complete list.
+Run the workflow from the `main` branch:
 
-Cached ETags are used for repeat requests when possible, but conditional requests still count against GitHub rate limits.
+1. Open the **Deploy managed app** workflow in GitHub Actions.
+2. Leave `confirm_deploy` as `false` for the default validation-only run. That path still validates secrets, runs CI, packs the app, and checks `ms app info --non-interactive --json` with the service principal, but it skips the live deploy step.
+3. Set `confirm_deploy` to `true` only when you want the same main-branch run to proceed to live deployment.
 
-## Security and privacy
+The workflow validates the required secrets and `ms.config.json`, runs `npm ci`, `npm test`, and `npm run build`, packs with the official managed apps actions pinned to immutable SHAs, verifies service-principal access with `ms app info --non-interactive --json`, and deploys only when explicitly confirmed.
 
-- No secrets, tokens, or sign in are required.
-- The app stores only the last successfully loaded username in local storage.
-- All repository links are constructed as safe GitHub URLs.
+GitHub-hosted runners are allowed to use their default public npm configuration for the managed apps CLI action. That cloud-runner allowance does not change the local repository policy above: local development here must continue using the machine's configured internal registry proxy.
+
+The workflow has not run yet from this repository state. An initial local `ms app info` attempt from this session failed during generic credential acquisition, so service-principal authentication is not claimed as verified yet; the expected first cloud check is the validation-only workflow run above. Credential rotation policy remains external to this repository.

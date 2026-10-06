@@ -1,8 +1,10 @@
-import type { RateLimitInfo, RepoFilters } from '../types';
+import type { GitHubAccountType, RequestBackoffInfo, RepoFilters } from '../types';
 
 type ControlsBarProps = {
   inputUsername: string;
+  accountType: GitHubAccountType;
   onInputUsernameChange: (value: string) => void;
+  onAccountTypeChange: (value: GitHubAccountType) => void;
   onSubmit: () => void;
   validationError: string | null;
   isLoading: boolean;
@@ -15,7 +17,7 @@ type ControlsBarProps = {
   filters: RepoFilters;
   onFiltersChange: (next: RepoFilters) => void;
   languages: string[];
-  rateLimit: RateLimitInfo;
+  backoff: RequestBackoffInfo;
   cooldownMessage: string | null;
   activeTheme: 'light' | 'dark';
   onToggleTheme: () => void;
@@ -58,13 +60,11 @@ function ThemeIcon({ activeTheme }: { activeTheme: 'light' | 'dark' }) {
 }
 
 export function ControlsBar(props: ControlsBarProps) {
-  const rateLimitLine = [
-    props.rateLimit.remaining !== null ? `${props.rateLimit.remaining} requests left` : null,
-    props.rateLimit.limit !== null ? `limit ${props.rateLimit.limit}` : null,
-    props.rateLimit.resetAt ? `reset ${new Date(props.rateLimit.resetAt).toLocaleString()}` : null,
-  ]
-    .filter(Boolean)
-    .join(', ');
+  const backoffLine = props.backoff.message
+    ? props.backoff.message
+    : props.backoff.cooldownUntil
+      ? `Connector backoff is active until ${new Date(props.backoff.cooldownUntil).toLocaleString()}.`
+      : 'Connector responses can pause auto refresh when the host reports throttling.';
 
   return (
     <section className="hero-card" aria-label="Dashboard controls">
@@ -73,7 +73,7 @@ export function ControlsBar(props: ControlsBarProps) {
           <p className="eyebrow">Public repository intelligence</p>
           <h1>GitHub repository insights</h1>
           <p className="hero-copy">
-            Load every public owner repository for a GitHub user or organization, then filter the list and inspect evidence based stack signals from root manifests.
+            Load public repositories through the hosted GitHub connector, then filter the list and compare primary language counts across a user or organization.
           </p>
         </div>
         <button type="button" className="secondary-button icon-button" onClick={props.onToggleTheme}>
@@ -91,7 +91,17 @@ export function ControlsBar(props: ControlsBarProps) {
           }}
         >
           <label className="field">
-            <span className="field-label">GitHub username or organization</span>
+            <span className="field-label">Owner type</span>
+            <select
+              value={props.accountType}
+              onChange={(event) => props.onAccountTypeChange(event.target.value as GitHubAccountType)}
+            >
+              <option value="user">User</option>
+              <option value="organization">Organization</option>
+            </select>
+          </label>
+          <label className="field">
+            <span className="field-label">GitHub owner login</span>
             <div className="input-shell">
               <SearchIcon />
               <input
@@ -221,8 +231,8 @@ export function ControlsBar(props: ControlsBarProps) {
 
       <div className="meta-strip">
         <p>{props.lastSuccessfulSyncLabel ? `Last successful sync ${props.lastSuccessfulSyncLabel}` : 'No successful sync yet.'}</p>
-        <p>{rateLimitLine || 'Rate limit headers will appear after the first GitHub response.'}</p>
-        <p>{props.cooldownMessage ?? 'Auto refresh pauses when the tab is hidden.'}</p>
+        <p>Open this app in App Player or the Local Play URL from the global ms app dev command, then sign in to the hosted GitHub connection.</p>
+        <p>{props.cooldownMessage ?? backoffLine}</p>
       </div>
     </section>
   );

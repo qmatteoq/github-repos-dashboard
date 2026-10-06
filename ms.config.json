@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/Managed-Apps/main/schemas/ms.config.schema.json",
+  "version": "0.0",
+  "appId": "d203bb2a-d163-448c-801c-3df90b89d198",
+  "appDisplayName": "GitHub repository insights",
+  "environmentId": "52ad1371-bae3-ec57-85f7-e72f6d5b2304",
+  "description": " ",
+  "repoType": "none",
+  "cloud": "public",
+  "buildPath": "./dist",
+  "buildCommand": "npm run build",
+  "buildEntryPoint": "index.html",
+  "connectionReferences": {
+    "dd6132b8-469e-4901-9d6c-ca9745eb3fae": {
+      "id": "/providers/Microsoft.PowerApps/apis/shared_github",
+      "displayName": "GitHub",
+      "dataSources": [
+        "github"
+      ],
+      "dataSets": {}
+    }
+  },
+  "appSettings": {
+    "showHeader": true
+  }
+}
